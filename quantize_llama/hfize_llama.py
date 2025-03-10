@@ -20,7 +20,7 @@ parser.add_argument('--hf_output_path', type=str)
 
 def main(args):
     assert os.path.exists(args.quantized_path)
-    saved_config = torch.load(os.path.join(args.quantized_path, 'config.pt'))
+    saved_config = torch.load(os.path.join(args.quantized_path, 'config.pt'), weights_only=False)
     model_config = saved_config['model_config']
     glog.info(model_config)
     fused = model_config.quip_params.get('fused', True)

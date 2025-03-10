@@ -13,9 +13,8 @@ _INV_PERMUTE = torch.zeros(256, dtype=torch.int64)
 _INV_PERMUTE[_PERMUTE] = torch.arange(256)
 
 
-def LDLQ(Wr, L, cb, args, buf_cols=128, for_kernel=True):
-    if for_kernel:
-        assert args.td_x == 16 and args.td_y == 16
+def LDLQ(Wr, L, cb, args, buf_cols=128, for_kernel=True, scalar=None):
+
     buf_cols = max(buf_cols, args.td_y)
     trellissz = args.td_x * args.td_y
     (m, n) = Wr.shape
@@ -53,24 +52,15 @@ def LDLQ(Wr, L, cb, args, buf_cols=128, for_kernel=True):
             if trellissz > -1:
                 WXWXshape = WXWX.shape
                 thing = WXWX.T.reshape(-1, trellissz)
-                if for_kernel:
-                    thing = thing[..., _PERMUTE]
-                q_out = cb.quantize(thing)
-                if for_kernel:
-                    thing = q_out[0][..., _INV_PERMUTE].reshape(
-                        WXWXshape[1], WXWXshape[0])
-                else:
-                    thing = q_out[0].reshape(WXWXshape[1], WXWXshape[0])
+                q_out = cb.quantize(thing, scalar)
+
+                thing = q_out[0].reshape(WXWXshape[1], WXWXshape[0])
                 idxs = q_out[1].reshape(WXWXshape[1], WXWXshape[0] // args.V)
                 b_hatWr_T[args.td_y * i:args.td_y * (i + 1)] = thing.T
                 b_Qidxs_T[args.td_y // args.V * i:args.td_y // args.V *
                           (i + 1)] = idxs.T
             else:
-                q_out = cb.quantize(WXWX.T)
-                b_hatWr_T[args.td_y * i:args.td_y * (i + 1)] = q_out[0].T
-                b_Qidxs_T[args.td_y // args.V * i:args.td_y // args.V *
-                          (i + 1)] = q_out[1].T
-
+                raise NotImplementedError
         prod_cache += b_L.T @ (b_Wr_T - b_hatWr_T)
         hatWr_T[args.td_y * (cur_col - buf_size):args.td_y *
                 cur_col] = b_hatWr_T

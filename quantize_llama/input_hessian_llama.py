@@ -25,9 +25,9 @@ parser.add_argument('--large_batch_size', default=512, type=int)
 parser.add_argument('--devset_size', default=8192, type=int)
 parser.add_argument('--ctx_size', default=4096, type=int)
 parser.add_argument('--base_model',
-                    default='meta-llama/Llama-2-70b-hf',
+                    default='meta-llama/Llama-2-7b-hf',
                     type=str)
-parser.add_argument('--save_path', default='hessians/llama2_70b', type=str)
+parser.add_argument('--save_path', default='hessians/llama2_7b', type=str)
 parser.add_argument('--sample_proc', default=32, type=int)
 
 
@@ -161,6 +161,7 @@ if __name__ == "__main__":
 
     dist.init_process_group(backend="nccl")
     gpu_id = int(os.environ["LOCAL_RANK"])
+    gpu_id = 0
     device = f"cuda:{gpu_id}"
     torch.cuda.set_device(device)
     torch.manual_seed(gpu_id)

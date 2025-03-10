@@ -15,7 +15,7 @@ from transformers import AutoModelForCausalLM
 from lib import codebook, utils
 from lib.linear import QuantizedLinear
 
-from . import ldlq
+from . import ldlq, dyd
 
 
 @contextmanager
@@ -100,7 +100,8 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
         break
     mixed_layer = mixed_layer.float()
 
-    train_dl, valid_dl = utils.split_data(pre_orig_emb, orig_emb, args)
+    # for tensor-wise fine-tuning
+    # train_dl, valid_dl = utils.split_data(pre_orig_emb, orig_emb, args)
 
     has_kernel = utils.has_kernel(args.decode_mode, args.L, args.K, args.V,
                                   args.tlut_bits, args.td_x, args.td_y)
@@ -108,13 +109,23 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
     for quant_i, (linear_attr, name, in_hess_name, out_hess_name,
                   rcp) in enumerate(quant_order):
         utils.clean()
+
+        # For each weight matrix of student model, compute DYD Decomposition
+
+        orig_linear = attrgetter(linear_attr)(mixed_layer)
+        D1, Y, D2 = dyd.decompose_matrix(orig_linear.weight.to(dtype_))
+
+        glog.info(f'computed {orig_linear} DYD Decomposition')    
+
         cb = cb.to(device).to(orig_dtype)
         orig_linear = attrgetter(linear_attr)(mixed_layer)
         W = orig_linear.weight.to(dtype_)
         del orig_linear
         (m, n) = W.shape
-        SU = (torch.randn(n, device=device).sign() + 1e-5).sign().to(dtype_)
-        SV = (torch.randn(m, device=device).sign() + 1e-5).sign().to(dtype_)
+        
+        # disable kernel
+        has_kernel = utils.has_kernel(args.decode_mode, args.L, args.K, args.V,
+                                  args.tlut_bits, args.td_x, args.td_y)
 
         in_hess_path = f'{args.in_hess_path}/{idx}_{in_hess_name}.pt'
         H_data = torch.load(in_hess_path, map_location=torch.device('cpu'))
@@ -124,68 +135,52 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
             HR += mu[None, :] * mu[:, None]
             del mu
         del H_data
+        HR = utils.regularize_H(HR, args.sigma_reg).to(device)
 
-        HR = utils.regularize_H(HR, args.sigma_reg)
+        # calculate an estimation of D, where x^T D x is approximately x^T H x
+        DTilde = torch.diagonal(HR)
+        DTilde_minus_half = DTilde.pow(-0.5).to(device)
+        # by power iteration, find the largest eigenvalue of D^{-1/2} H D^{-1/2}
+        v = torch.randn(n, device=device).unsqueeze(1)
+        HTilde = DTilde_minus_half[:, None] * HR * DTilde_minus_half[None, :]
+        for i in range(args.power_iter):
+            v = HTilde @ v
+            v /= v.norm()
+        lambda_max = v.T @ HTilde @ v
+        print("lambda_max:", lambda_max, flush=True)
+        lambda_max = lambda_max.view(-1)
+        D = (lambda_max * DTilde).to(device)
 
-        if args.split_for_tp:
-            if rcp == 'col':
-                # split along output dimension
-                Wr = utils.matmul_hadUt(
-                    utils.matmul_hadUt((W.T.to(device) * SV).reshape(
-                        n * args.tp_rank, m // args.tp_rank)).reshape(
-                            W.T.shape).T * SU)
-                HRr = utils.matmul_hadUt(
-                    utils.matmul_hadUt(HR.to(device) * SU).T * SU)
-
-                Wscale = Wr.reshape(
-                    args.tp_rank, m * n // args.tp_rank).square().mean(
-                        dim=-1).sqrt() / (cb.lut.to(
-                            torch.float64).square().mean().sqrt().float() *
-                                          args.scale_override)
-                Wr = Wr.reshape(args.tp_rank,
-                                m * n // args.tp_rank) / Wscale.unsqueeze(-1)
-                Wr = Wr.reshape(m, n)
-
-            elif rcp == 'row':
-                # split along input dimension
-                Wr = utils.matmul_hadUt(
-                    (utils.matmul_hadUt(W.T.to(device) * SV).T * SU).reshape(
-                        m * args.tp_rank, n // args.tp_rank)).reshape(W.shape)
-                HRr = utils.matmul_hadUt(
-                    (utils.matmul_hadUt((HR.to(device) * SU).reshape(
-                        n * args.tp_rank, n // args.tp_rank)).reshape(n, n).T *
-                     SU).reshape(n * args.tp_rank,
-                                 n // args.tp_rank)).reshape(n, n)
-                Wscale = Wr.reshape(
-                    m, args.tp_rank,
-                    n // args.tp_rank).transpose(0, 1).reshape(
-                        args.tp_rank, m * n // args.tp_rank).square().mean(
-                            dim=-1).sqrt() / (cb.lut.to(
-                                torch.float64).square().mean().sqrt().float() *
-                                              args.scale_override)
-                Wr = Wr.reshape(m, args.tp_rank, n // args.tp_rank).transpose(
-                    0, 1).reshape(args.tp_rank,
-                                  m * n // args.tp_rank) / Wscale.unsqueeze(-1)
-                Wr = Wr.reshape(args.tp_rank, m,
-                                n // args.tp_rank).transpose(0,
-                                                             1).reshape(m, n)
-
-        else:
-            Wr = utils.matmul_hadUt(
-                utils.matmul_hadUt(W.T.to(device) * SV).T * SU)
-            HRr = utils.matmul_hadUt(
-                utils.matmul_hadUt(HR.to(device) * SU).T * SU)
-            
-            Wscale = Wr.square().mean().sqrt() / (
-                cb.lut.to(torch.float64).square().mean().sqrt().float() *
-                args.scale_override)
-            Wr /= Wscale
+        Wr = Y.to(device)
+        HRr = HR.to(device)
+        
+        Wscale = Wr.square().mean().sqrt() / (
+            cb.lut.to(torch.float64).square().mean().sqrt().float() *
+            args.scale_override)
+        Wr /= Wscale
 
         LRr, _ = utils.block_LDL(HRr, args.td_y)
+        zeroLRr = torch.zeros_like(LRr, device=LRr.device)
         diag = torch.arange(n, device=LRr.device)
         LRr[diag, diag] = 0
+        args.td_x = m
+        args.td_y = n
 
-        hatWr, Qidxs = ldlq.LDLQ(Wr, LRr, cb, args, for_kernel=has_kernel)
+        scalar = torch.zeros(m, n, device=device)
+
+        for i in range(scalar.shape[0]):
+            for j in range(scalar.shape[1]):
+                scalar[i][j] = D1[i] * D1[i] * D2[j] * D2[j] * D[j]
+
+        # apply random permutation to the flattened Wr and Scalar
+
+        permutation = torch.randperm(m * n)
+        
+        Wr = Wr.flatten()[permutation].reshape(m, n)
+        scalar = scalar.flatten()[permutation].reshape(m, n)
+        
+        hatWr, Qidxs = ldlq.LDLQ(Wr, zeroLRr, cb, args, for_kernel=has_kernel)
+
 
         Qidxs = Qidxs.cpu()
         packed = cb.pack_trellis(
@@ -193,14 +188,7 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
                           args.td_y // args.V).transpose(1, 2).reshape(
                               -1, args.td_x * args.td_y // args.V))
 
-        if has_kernel:
-            packed = packed.view(torch.uint8).view(-1, 2).flip(
-                (-1, )).reshape(m // 16 // 2, 2, n // 16 // 2, 2, 16 * 16 // 8,
-                                args.K).permute(0, 2, 4, 3, 1, 5).flip(
-                                    (-1, )).contiguous().flatten().view(
-                                        torch.int16).reshape(packed.shape)
-        else:
-            packed = packed.view(torch.int16)
+        packed = packed.view(torch.int16)
 
         if rcp == 'col':
             Wr = (Wr.reshape(args.tp_rank, m * n // args.tp_rank) *
@@ -221,13 +209,84 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
         else:
             Wr *= Wscale
             hatWr *= Wscale
-
-        err = torch.trace(
-            (Wr - hatWr) @ HRr @ (Wr - hatWr).T) / torch.trace(Wr @ HRr @ Wr.T)
-        print(
-            f'{idx}_{name} proxy err {err.item()} tr(WHW.T) {torch.trace(Wr @ HRr @ Wr.T)}'
-        )
         
+        inverse_permutation = torch.argsort(permutation)
+        Wr = Wr.flatten()[inverse_permutation].reshape(m, n)
+        hatWr = hatWr.flatten()[inverse_permutation].reshape(m, n)
+        scalar = scalar.flatten()[inverse_permutation].reshape(m, n)
+        print(f"Wr after initialize and scaling:", Wr, flush=True)
+        print(f"hatWr after initialize and scaling:", hatWr, flush=True)
+        squeezed_D1col = D1[:, None].to(device)
+        squeezed_D1row = D1[None, :].to(device)
+        squeezed_D2row = D2[None, :].to(device)
+        squeezed_D2col = D2[:, None].to(device)
+        err = torch.trace(
+            (squeezed_D1col * (Wr - hatWr) * squeezed_D2row) @ HRr @ (squeezed_D2col * (Wr - hatWr).T * squeezed_D1row)) / torch.trace((squeezed_D1col * Wr * squeezed_D2row) @ HRr @ (squeezed_D2col * Wr.T * squeezed_D1row))
+        print(
+            f'initialize W_0 {idx}_{name} with LDLQ, proxy err {err.item()} tr(WHW.T) {torch.trace((squeezed_D1col * Wr * squeezed_D2row) @ HRr @ (squeezed_D2col * Wr.T * squeezed_D1row))}'
+        )
+        # update the weights by descending of proxy loss
+
+
+        for i in range(args.update_iter):
+            
+            Wr /= Wscale
+            hatWr /= Wscale
+
+
+            V = (hatWr - ((hatWr - Wr) @ HRr) * (1 / D)[None, :])
+
+            Wr = Wr.flatten()[permutation].reshape(m, n)
+            hatWr = hatWr.flatten()[permutation].reshape(m, n)
+            scalar = scalar.flatten()[permutation].reshape(m, n)
+            V = V.flatten()[permutation].reshape(m, n)
+            print(f"Wr before {i+1}-th update:", Wr, flush=True)
+            print(f"hatWr before {i+1}-th update:", hatWr, flush=True)
+
+            hatWr, Qidxs = ldlq.LDLQ(V, zeroLRr, cb, args, for_kernel=has_kernel, scalar=scalar)
+            print(f"Wr after {i+1}-th update:", Wr, flush=True)
+            print(f"hatWr after {i+1}-th update:", hatWr, flush=True)
+            Qidxs = Qidxs.cpu()
+            packed = cb.pack_trellis(
+                Qidxs.reshape(m // args.td_x, args.td_x, n // args.td_y,
+                            args.td_y // args.V).transpose(1, 2).reshape(
+                                -1, args.td_x * args.td_y // args.V))
+
+
+            packed = packed.view(torch.int16)
+
+            if rcp == 'col':
+                Wr = (Wr.reshape(args.tp_rank, m * n // args.tp_rank) *
+                    Wscale.unsqueeze(-1)).reshape(m, n)
+                hatWr = (hatWr.reshape(args.tp_rank, m * n // args.tp_rank) *
+                        Wscale.unsqueeze(-1)).reshape(m, n)
+            elif rcp == 'row':
+                Wr = Wr.reshape(m, args.tp_rank, n // args.tp_rank).transpose(
+                    0, 1).reshape(args.tp_rank, -1) * Wscale.unsqueeze(-1)
+                Wr = Wr.reshape(args.tp_rank, m,
+                                n // args.tp_rank).transpose(0, 1).reshape(m, n)
+                hatWr = hatWr.reshape(m, args.tp_rank,
+                                    n // args.tp_rank).transpose(0, 1).reshape(
+                                        args.tp_rank, -1) * Wscale.unsqueeze(-1)
+                hatWr = hatWr.reshape(args.tp_rank, m,
+                                    n // args.tp_rank).transpose(0, 1).reshape(
+                                        m, n)
+            else:
+                Wr *= Wscale
+                hatWr *= Wscale
+
+            Wr = Wr.flatten()[inverse_permutation].reshape(m, n)
+            hatWr = hatWr.flatten()[inverse_permutation].reshape(m, n)
+            scalar = scalar.flatten()[inverse_permutation].reshape(m, n)
+
+            print(f"Wr after {i+1}-th update and scaling:", Wr, flush=True)
+            print(f"hatWr after {i+1}-th update and scaling:", hatWr, flush=True)
+            err = torch.trace(
+            (squeezed_D1col * (Wr - hatWr) * squeezed_D2row) @ HRr @ (squeezed_D2col * (Wr - hatWr).T * squeezed_D1row)) / torch.trace((squeezed_D1col * Wr * squeezed_D2row) @ HRr @ (squeezed_D2col * Wr.T * squeezed_D1row))
+            print(
+                f'Updated W_{i+1} {idx}_{name} with LDLQ, proxy err {err.item()} tr(WHW.T) {torch.trace((squeezed_D1col * Wr * squeezed_D2row) @ HRr @ (squeezed_D2col * Wr.T * squeezed_D1row))}'
+            )
+
         save_path = f'{args.save_path}/{idx}_{name}.pt'
 
         # 0 = no tensor parallelism, 1 = row parallel, 2 = column parallel
@@ -239,10 +298,6 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
             {
                 'trellis':
                 packed.cpu(),
-                'SU':
-                SU.to(orig_dtype).cpu(),
-                'SV':
-                SV.to(orig_dtype).cpu(),
                 'Wscale':
                 Wscale,
                 'proxy_err':
@@ -274,13 +329,13 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
             dtype=orig_dtype,
             grad_ckpt=args.ft_grad_ckpt)
         q_linear.trellis.copy_(packed)
-        q_linear.SU.copy_(SU)
-        q_linear.SV.copy_(SV)
+        # q_linear.SU.copy_(SU)
+        # q_linear.SV.copy_(SV)
         q_linear.rcp.copy_(rcp_int)
         q_linear.tp_rank.copy_(args.tp_rank)
         q_linear = q_linear.to(device).float()
 
-        del packed, SU, SV
+        # del packed, SU, SV
         utils.clean()
         
         if rcp == 'row':
@@ -309,9 +364,10 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
             attrgetter('.'.join(split_attr[:-1]))(mixed_layer), split_attr[-1],
             q_linear)
 
-        with torch.enable_grad():
-            finetune_decoder_layer(mixed_layer, f'{idx}_{name}', device,
-                                   train_dl, valid_dl, orig_dtype, args)
+        # for tensor-wise fine-tuning
+        # with torch.enable_grad():
+        #     finetune_decoder_layer(mixed_layer, f'{idx}_{name}', device,
+        #                            train_dl, valid_dl, orig_dtype, args)
 
         cb = cb.cpu()
         utils.clean()

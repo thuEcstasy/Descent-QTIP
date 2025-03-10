@@ -14,6 +14,7 @@ from transformers.modeling_attn_mask_utils import \
 
 from lib import utils
 from lib.algo import finetune
+from lib.algo import hvp, dyd
 from lib.codebook import bitshift
 from operator import attrgetter
 
@@ -37,7 +38,7 @@ parser.add_argument('--lowmem_ldlq', action='store_true')
 parser.add_argument('--ft_lr', default=3e-6, type=float)
 parser.add_argument('--ft_bs', default=4, type=int)
 parser.add_argument('--ft_update_freq', default=1, type=int)
-parser.add_argument('--ft_epochs', default=5, type=int)
+parser.add_argument('--ft_epochs', default=0, type=int)
 parser.add_argument('--ft_valid_freq', default=1, type=int)
 parser.add_argument('--ft_valid_size', default=128, type=float)
 parser.add_argument('--ft_early_stop', default=5, type=int)
@@ -53,13 +54,19 @@ parser.add_argument('--ft_train_lut', action='store_true')
 parser.add_argument('--split_for_tp', action='store_true')
 parser.add_argument('--tp_rank', default=8, type=int)
 parser.add_argument('--skip_list', default=None, type=str)
-
+parser.add_argument('--power_iter', default=100, type=int)
+parser.add_argument('--update_iter', default=10, type=int)
 
 def check_exist(idx, args):
     suffix = ['q', 'k', 'v', 'o', 'up', 'down', 'layernorm']
+    dyd_suffix = ['q', 'k', 'v', 'o', 'up', 'down']
     for _ in suffix:
-        test = f'{args.save_path}/{idx}_{_}.pt'
-        if not os.path.exists(test):
+        pt = f'{args.save_path}/{idx}_{_}.pt'
+        if not os.path.exists(pt):
+            return False
+    for _ in dyd_suffix:
+        dyd = f'{args.save_path}/dyd_{idx}_{_}.pt'
+        if not os.path.exists(dyd):
             return False
     return True
 
@@ -108,9 +115,15 @@ def main(args):
                                     tlut_bits=args.tlut_bits,
                                     decode_mode=args.decode_mode)
     model = AutoModelForCausalLM.from_pretrained(args.base_model,
-                                                 torch_dtype='auto',
-                                                 low_cpu_mem_usage=True)
+                                                 torch_dtype=torch.float16,
+                                                 low_cpu_mem_usage=True,
+                                                #  attn_implementation="eager"
+                                                )
 
+    # teacher_model = AutoModelForCausalLM.from_pretrained(args.base_model,
+    #                                                      torch_dtype=torch.float16,
+    #                                                      low_cpu_mem_usage=True,
+    #                                                      attn_implementation="eager")
     # save configs
     all_config = {'quant_args': args, 'model_config': model.config}
     quip_params = {
@@ -138,6 +151,7 @@ def main(args):
     glog.info('loaded dataset and devset')
 
     nproc = torch.cuda.device_count()
+    print(f'using {nproc} GPUs')
     orig_emb_cache = [model.model.embed_tokens(devset)]
 
     for _ in range(nproc):
@@ -154,6 +168,7 @@ def main(args):
 
     cur_device = 0
     proc_list = [None for _ in range(nproc)]
+
     for i in range(len(model.model.layers)):
         glog.info(f'layer {i} gpu {cur_device}')
         if proc_list[cur_device] is not None:

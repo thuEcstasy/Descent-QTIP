@@ -2,12 +2,13 @@
 
 import json
 import os
-
+import sys
 import accelerate
 import torch
 import transformers
 
 from model.llama import LlamaForCausalLM
+
 
 
 def model_from_hf_path(path, max_mem_ratio=0.7, device_map=None):
@@ -16,6 +17,15 @@ def model_from_hf_path(path, max_mem_ratio=0.7, device_map=None):
     bad_config = transformers.AutoConfig.from_pretrained(path)
     is_quantized = hasattr(bad_config, 'quip_params')
     model_type = bad_config.model_type
+
+    if model_type == 'bitllama':
+        model_str = path
+        model = transformers.BitLlamaForCausalLMInf.from_pretrained(
+            path,
+            torch_dtype='auto',
+            low_cpu_mem_usage=True,
+            attn_implementation='sdpa',
+            device_map=device_map)
     if is_quantized:
         if model_type == 'llama':
             model_str = transformers.LlamaConfig.from_pretrained(

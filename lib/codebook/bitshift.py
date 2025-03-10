@@ -201,8 +201,12 @@ class bitshift_codebook(nn.Module):
                         encoded.int().to(self.lut.device)].to(encoded.device)
 
     @torch.compile
-    def update(self, cost, thing):
-        state_err = (self.recons_state -
+    def update(self, cost, thing, scalar=None):
+        if scalar is not None:
+            state_err = (scalar.unsqueeze(-1).unsqueeze(-1) * ((self.recons_state -
+                         thing.unsqueeze(-1)).square())).sum(dim=0)
+        else:
+            state_err = (self.recons_state -
                      thing.unsqueeze(-1)).square().sum(dim=0)
         cand_cost = torch.gather(
             cost.unsqueeze(-2).expand(-1, self.state_cand.shape[1], -1), -1,
@@ -215,11 +219,16 @@ class bitshift_codebook(nn.Module):
             best.indices.unsqueeze(-1))[..., 0]
         return prev_state, cost
 
-    def viterbi(self, X, overlap=None):
+    def viterbi(self, X, overlap=None, scalar=None):
         T, B = X.shape
         assert T % self.V == 0
         # cost is (B, 2**L)
-        cost = (self.recons_state -
+        # modify viterbi cost by scaling the cost
+        if scalar is not None:
+            cost = (scalar[:self.V].unsqueeze(-1).unsqueeze(-1) * ((self.recons_state -
+                X[:self.V].unsqueeze(-1)).square())).sum(dim=0)
+        else:
+            cost = (self.recons_state -
                 X[:self.V].unsqueeze(-1)).square().sum(dim=0)
 
         if overlap is not None:
@@ -237,7 +246,11 @@ class bitshift_codebook(nn.Module):
                                  device=self.state.device)
 
         for i in range(1, T // self.V):
-            from_state[i], cost = self.update(cost,
+            if scalar is not None:
+                from_state[i], cost = self.update(cost,
+                                              X[i * self.V:(i + 1) * self.V], scalar[i * self.V:(i + 1) * self.V])
+            else:
+                from_state[i], cost = self.update(cost,
                                               X[i * self.V:(i + 1) * self.V])
 
         if overlap is not None:
@@ -258,7 +271,7 @@ class bitshift_codebook(nn.Module):
                 (self.K * self.V))[..., 0]
         return final_state
 
-    def quantize_seq(self, X, overlap=None, **kwargs):
+    def quantize_seq(self, X, overlap=None, scalar=None):
         T, NO = X.shape
         bs = min(2**(24 - self.L), NO)
         pad_amt = math.ceil(NO / bs) * bs - NO
@@ -276,17 +289,25 @@ class bitshift_codebook(nn.Module):
                             device=X.device)
         for i in range(len(X)):
             b_overlap = None if overlap is None else overlap[i]
-            Qidxs[i] = self.viterbi(X[i], overlap=b_overlap)
+            Qidxs[i] = self.viterbi(X[i], overlap=b_overlap, scalar=scalar)
         Qidxs = Qidxs.transpose(0, 1).reshape(T // self.V, N)[:, :NO]
         return Qidxs
 
-    def quantize(self, X, **kwargs):
+    def quantize(self, X, scalar=None):
+
         X = X.T.contiguous().to(torch.float16)
         T = X.shape[0]
         roll_X = torch.roll(X, T // (2 * self.V) * self.V, 0)
-        state = self.quantize_seq(roll_X, overlap=None)
+        
+        if scalar is not None:
+            scalar = scalar.flatten()
+            roll_scalar = torch.roll(scalar, T // (2 * self.V) * self.V, 0)
+        else:
+            roll_scalar = None
+
+        state = self.quantize_seq(roll_X, overlap=None, scalar=roll_scalar)
         overlap = state[T // (2 * self.V)] >> self.K * self.V
-        state = self.quantize_seq(X, overlap=overlap)
+        state = self.quantize_seq(X, overlap=overlap, scalar=scalar)
         hatX = self.recons(state).transpose(0, 1).reshape(X.shape)
         return hatX.T.contiguous().to(X.device), state.T.contiguous().to(
             X.device)
@@ -472,7 +493,6 @@ class BitshiftLinear(nn.Module):
         return x.view(*input.shape[:-1], m).to(input.dtype)
 
 
-        
 class BitshiftLinearKernelAG(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, trellis, m, n, L, tlut_bits, K, V, lut):
@@ -500,6 +520,6 @@ class BitshiftLinearKernelAG(torch.autograd.Function):
 
         hatW = decode_compressed(L, tlut_bits, K, int(math.log2(V)),
                                  m, n, trellis.view(-1), lut.T)
-        
+
         grad_input = grad_output.to(hatW.dtype) @ hatW
         return grad_input, None, None, None, None, None, None, None, None

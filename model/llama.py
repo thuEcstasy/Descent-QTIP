@@ -451,7 +451,7 @@ class LlamaAttention(nn.Module):
         tlut_bits = config.quip_params['tlut_bits']
         decode_mode = config.quip_params['decode_mode']
 
-        if config.quip_params['skip_list'] is None:
+        if 'skip_list' not in config.quip_params or config.quip_params['skip_list'] is None:
             config.quip_params['skip_list'] = []
 
         
