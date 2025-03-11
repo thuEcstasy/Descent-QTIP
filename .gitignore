@@ -9,8 +9,9 @@ __pycache__/
 slurm_out/
 ckpts/
 logs/
-hfized/
+hfized/  
 fast-hadamard-transform/build/
 fast-hadamard-transform/dist/
 report*.nsys-rep
 report*.sqlite
+hessians/

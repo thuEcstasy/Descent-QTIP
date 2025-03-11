@@ -147,24 +147,58 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
             v = HTilde @ v
             v /= v.norm()
         lambda_max = v.T @ HTilde @ v
-        print("lambda_max:", lambda_max, flush=True)
+        print("lambda_max of HTilde:", lambda_max, flush=True)
         lambda_max = lambda_max.view(-1)
-        D = (lambda_max * DTilde).to(device)
+        # D = (lambda_max * DTilde).to(device) / 10
+        D = torch.ones(n, device=device) * torch.trace(HR) / 50
 
-        Wr = Y.to(device)
-        HRr = HR.to(device)
-        
-        Wscale = Wr.square().mean().sqrt() / (
-            cb.lut.to(torch.float64).square().mean().sqrt().float() *
-            args.scale_override)
-        Wr /= Wscale
+        if args.split_for_tp:
+            if rcp == 'col':
+                # split along output dimension
+                Wr = Y.to(device)
+                HRr = HR.to(device)
+
+                Wscale = Wr.reshape(
+                    args.tp_rank, m * n // args.tp_rank).square().mean(
+                        dim=-1).sqrt() / (cb.lut.to(
+                            torch.float64).square().mean().sqrt().float() *
+                                          args.scale_override)
+                Wr = Wr.reshape(args.tp_rank,
+                                m * n // args.tp_rank) / Wscale.unsqueeze(-1)
+                Wr = Wr.reshape(m, n)
+
+            elif rcp == 'row':
+                # split along input dimension
+                Wr = Y.to(device)
+                HRr = HR.to(device)
+                Wscale = Wr.reshape(
+                    m, args.tp_rank,
+                    n // args.tp_rank).transpose(0, 1).reshape(
+                        args.tp_rank, m * n // args.tp_rank).square().mean(
+                            dim=-1).sqrt() / (cb.lut.to(
+                                torch.float64).square().mean().sqrt().float() *
+                                              args.scale_override)
+                Wr = Wr.reshape(m, args.tp_rank, n // args.tp_rank).transpose(
+                    0, 1).reshape(args.tp_rank,
+                                  m * n // args.tp_rank) / Wscale.unsqueeze(-1)
+                Wr = Wr.reshape(args.tp_rank, m,
+                                n // args.tp_rank).transpose(0,
+                                                             1).reshape(m, n)
+
+        else:
+            Wr = Y.to(device)
+            HRr = HR.to(device)
+            
+            Wscale = Wr.square().mean().sqrt() / (
+                cb.lut.to(torch.float64).square().mean().sqrt().float() *
+                args.scale_override)
+            Wr /= Wscale
 
         LRr, _ = utils.block_LDL(HRr, args.td_y)
         zeroLRr = torch.zeros_like(LRr, device=LRr.device)
         diag = torch.arange(n, device=LRr.device)
         LRr[diag, diag] = 0
-        args.td_x = m
-        args.td_y = n
+
 
         scalar = torch.zeros(m, n, device=device)
 
@@ -174,12 +208,12 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
 
         # apply random permutation to the flattened Wr and Scalar
 
-        permutation = torch.randperm(m * n)
+        # permutation = torch.randperm(m * n)
         
-        Wr = Wr.flatten()[permutation].reshape(m, n)
-        scalar = scalar.flatten()[permutation].reshape(m, n)
+        # Wr = Wr.flatten()[permutation].reshape(m, n)
+        # scalar = scalar.flatten()[permutation].reshape(m, n)
         
-        hatWr, Qidxs = ldlq.LDLQ(Wr, zeroLRr, cb, args, for_kernel=has_kernel)
+        hatWr, Qidxs = ldlq.LDLQ(Wr, LRr, cb, args, for_kernel=has_kernel)
 
 
         Qidxs = Qidxs.cpu()
@@ -210,10 +244,10 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
             Wr *= Wscale
             hatWr *= Wscale
         
-        inverse_permutation = torch.argsort(permutation)
-        Wr = Wr.flatten()[inverse_permutation].reshape(m, n)
-        hatWr = hatWr.flatten()[inverse_permutation].reshape(m, n)
-        scalar = scalar.flatten()[inverse_permutation].reshape(m, n)
+        # inverse_permutation = torch.argsort(permutation)
+        # Wr = Wr.flatten()[inverse_permutation].reshape(m, n)
+        # hatWr = hatWr.flatten()[inverse_permutation].reshape(m, n)
+        # scalar = scalar.flatten()[inverse_permutation].reshape(m, n)
         print(f"Wr after initialize and scaling:", Wr, flush=True)
         print(f"hatWr after initialize and scaling:", hatWr, flush=True)
         squeezed_D1col = D1[:, None].to(device)
@@ -227,19 +261,16 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
         )
         # update the weights by descending of proxy loss
 
-
         for i in range(args.update_iter):
             
             Wr /= Wscale
             hatWr /= Wscale
+            V = hatWr - (((hatWr - Wr) @ HRr) * (1 / D)[None, :])
 
-
-            V = (hatWr - ((hatWr - Wr) @ HRr) * (1 / D)[None, :])
-
-            Wr = Wr.flatten()[permutation].reshape(m, n)
-            hatWr = hatWr.flatten()[permutation].reshape(m, n)
-            scalar = scalar.flatten()[permutation].reshape(m, n)
-            V = V.flatten()[permutation].reshape(m, n)
+            # Wr = Wr.flatten()[permutation].reshape(m, n)
+            # hatWr = hatWr.flatten()[permutation].reshape(m, n)
+            # scalar = scalar.flatten()[permutation].reshape(m, n)
+            # V = V.flatten()[permutation].reshape(m, n)
             print(f"Wr before {i+1}-th update:", Wr, flush=True)
             print(f"hatWr before {i+1}-th update:", hatWr, flush=True)
 
@@ -275,9 +306,9 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
                 Wr *= Wscale
                 hatWr *= Wscale
 
-            Wr = Wr.flatten()[inverse_permutation].reshape(m, n)
-            hatWr = hatWr.flatten()[inverse_permutation].reshape(m, n)
-            scalar = scalar.flatten()[inverse_permutation].reshape(m, n)
+            # Wr = Wr.flatten()[inverse_permutation].reshape(m, n)
+            # hatWr = hatWr.flatten()[inverse_permutation].reshape(m, n)
+            # scalar = scalar.flatten()[inverse_permutation].reshape(m, n)
 
             print(f"Wr after {i+1}-th update and scaling:", Wr, flush=True)
             print(f"hatWr after {i+1}-th update and scaling:", hatWr, flush=True)

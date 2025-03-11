@@ -20,14 +20,17 @@ def block_LDL(H, b, check_nan=True):
         L = torch.linalg.cholesky(H)
     except:
         return None
-
+    
     DL = torch.diagonal(L.reshape(m, b, m, b), dim1=0, dim2=2).permute(2, 0, 1)
+    print(DL.shape)
     D = (DL @ DL.permute(0, 2, 1)).cpu()
+    print(D.shape)
     DL = torch.linalg.inv(DL)
+    print(DL.shape)
     L = L.view(n, m, b)
     for i in range(m):
         L[:, i, :] = L[:, i, :] @ DL[i, :, :]
-
+    print(L.shape)
     if check_nan and L.isnan().any():
         return None
 
@@ -37,7 +40,7 @@ def block_LDL(H, b, check_nan=True):
            b).permute(0, 2, 1,
                       3)[torch.arange(m), torch.arange(m)] = torch.stack(
                           [torch.eye(b, device=L.device, dtype=H.dtype)] * m)
-
+    print(L.shape)
     return (L, D.to(DL.device))
 
 

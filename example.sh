@@ -31,7 +31,7 @@ python -m quantize_llama.quantize_finetune_llama \
        >> $LOG/3_1b_2bit.out 2>&1
 
 # convert the quantized model to a hf model
-# python -m quantize_llama.hfize_llama --quantized_path $CKPT/3_8b_2bit --hf_output_path $HF/3_8b_2bit >> $LOG/3_8b_2bit 2>&1 
+# python -m quantize_llama.hfize_llama --quantized_path $CKPT/3_1b_2bit --hf_output_path $HF/3_1b_2bit >> $LOG/3_1b_2bit 2>&1 
 
 # # do end to end finetuning
 # python -m quantize_llama.finetune_e2e_llama --base_model meta-llama/Meta-Llama-3-8b --hf_path $HF/3_8b_2bit --devset_size 640 --ft_valid_size 128 --ft_epochs 4 --ft_update_freq 4 --ft_bs 2 --ctx_size 4096 --ft_train_lut --hf_output_path $HF/3_8b_2bit >> $LOG/3_8b_2bit 2>&1
