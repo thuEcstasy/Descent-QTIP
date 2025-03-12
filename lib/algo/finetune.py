@@ -113,7 +113,6 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
         # For each weight matrix of student model, compute DYD Decomposition
 
         orig_linear = attrgetter(linear_attr)(mixed_layer)
-        D1, Y, D2 = dyd.decompose_matrix(orig_linear.weight.to(dtype_))
 
         glog.info(f'computed {orig_linear} DYD Decomposition')    
 
@@ -122,7 +121,8 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
         W = orig_linear.weight.to(dtype_)
         del orig_linear
         (m, n) = W.shape
-        
+        SU = (torch.randn(n, device=device).sign() + 1e-5).sign().to(dtype_)
+        SV = (torch.randn(m, device=device).sign() + 1e-5).sign().to(dtype_)
         # disable kernel
         has_kernel = utils.has_kernel(args.decode_mode, args.L, args.K, args.V,
                                   args.tlut_bits, args.td_x, args.td_y)
@@ -137,26 +137,15 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
         del H_data
         HR = utils.regularize_H(HR, args.sigma_reg).to(device)
 
-        # calculate an estimation of D, where x^T D x is approximately x^T H x
-        DTilde = torch.diagonal(HR)
-        DTilde_minus_half = DTilde.pow(-0.5).to(device)
-        # by power iteration, find the largest eigenvalue of D^{-1/2} H D^{-1/2}
-        v = torch.randn(n, device=device).unsqueeze(1)
-        HTilde = DTilde_minus_half[:, None] * HR * DTilde_minus_half[None, :]
-        for i in range(args.power_iter):
-            v = HTilde @ v
-            v /= v.norm()
-        lambda_max = v.T @ HTilde @ v
-        print("lambda_max of HTilde:", lambda_max, flush=True)
-        lambda_max = lambda_max.view(-1)
-        # D = (lambda_max * DTilde).to(device) / 10
-        D = torch.ones(n, device=device) * torch.trace(HR) / 50
-
         if args.split_for_tp:
             if rcp == 'col':
                 # split along output dimension
-                Wr = Y.to(device)
-                HRr = HR.to(device)
+                Wr = utils.matmul_hadUt(
+                    utils.matmul_hadUt((W.T.to(device) * SV).reshape(
+                        n * args.tp_rank, m // args.tp_rank)).reshape(
+                            W.T.shape).T * SU)
+                HRr = utils.matmul_hadUt(
+                    utils.matmul_hadUt(HR.to(device) * SU).T * SU)
 
                 Wscale = Wr.reshape(
                     args.tp_rank, m * n // args.tp_rank).square().mean(
@@ -169,8 +158,14 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
 
             elif rcp == 'row':
                 # split along input dimension
-                Wr = Y.to(device)
-                HRr = HR.to(device)
+                Wr = utils.matmul_hadUt(
+                    (utils.matmul_hadUt(W.T.to(device) * SV).T * SU).reshape(
+                        m * args.tp_rank, n // args.tp_rank)).reshape(W.shape)
+                HRr = utils.matmul_hadUt(
+                    (utils.matmul_hadUt((HR.to(device) * SU).reshape(
+                        n * args.tp_rank, n // args.tp_rank)).reshape(n, n).T *
+                     SU).reshape(n * args.tp_rank,
+                                 n // args.tp_rank)).reshape(n, n)
                 Wscale = Wr.reshape(
                     m, args.tp_rank,
                     n // args.tp_rank).transpose(0, 1).reshape(
@@ -186,13 +181,37 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
                                                              1).reshape(m, n)
 
         else:
-            Wr = Y.to(device)
-            HRr = HR.to(device)
+            Wr = utils.matmul_hadUt(
+                utils.matmul_hadUt(W.T.to(device) * SV).T * SU)
+            HRr = utils.matmul_hadUt(
+                utils.matmul_hadUt(HR.to(device) * SU).T * SU)
             
             Wscale = Wr.square().mean().sqrt() / (
                 cb.lut.to(torch.float64).square().mean().sqrt().float() *
                 args.scale_override)
             Wr /= Wscale
+
+        print(f"Before DYD decomposition: Wr: {Wr}", flush=True)
+        D1, Y, D2 = dyd.decompose_matrix(Wr.to(dtype_))
+        print(f"D1: {D1}, Y: {Y}, D2: {D2}", flush=True)
+
+        Wr = Y.to(device)
+        del Y
+
+        # calculate an estimation of D, where x^T D x is approximately x^T H x
+        DTilde = torch.diagonal(HRr)
+        DTilde_minus_half = DTilde.pow(-0.5).to(device)
+        # by power iteration, find the largest eigenvalue of D^{-1/2} H D^{-1/2}
+        v = torch.randn(n, device=device).unsqueeze(1)
+        HTilde = DTilde_minus_half[:, None] * HRr * DTilde_minus_half[None, :]
+        for i in range(args.power_iter):
+            v = HTilde @ v
+            v /= v.norm()
+        lambda_max = v.T @ HTilde @ v
+        print("lambda_max of HTilde:", lambda_max, flush=True)
+        lambda_max = lambda_max.view(-1)
+        D = (lambda_max * DTilde).to(device)
+        # D = torch.ones(n, device=device) * torch.trace(HR) / 50
 
         LRr, _ = utils.block_LDL(HRr, args.td_y)
         zeroLRr = torch.zeros_like(LRr, device=LRr.device)
@@ -247,9 +266,7 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
         # inverse_permutation = torch.argsort(permutation)
         # Wr = Wr.flatten()[inverse_permutation].reshape(m, n)
         # hatWr = hatWr.flatten()[inverse_permutation].reshape(m, n)
-        # scalar = scalar.flatten()[inverse_permutation].reshape(m, n)
-        print(f"Wr after initialize and scaling:", Wr, flush=True)
-        print(f"hatWr after initialize and scaling:", hatWr, flush=True)
+        # scalar = scalar.flatten()[inverse_permutation].reshape(m, n) we
         squeezed_D1col = D1[:, None].to(device)
         squeezed_D1row = D1[None, :].to(device)
         squeezed_D2row = D2[None, :].to(device)
@@ -271,12 +288,8 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
             # hatWr = hatWr.flatten()[permutation].reshape(m, n)
             # scalar = scalar.flatten()[permutation].reshape(m, n)
             # V = V.flatten()[permutation].reshape(m, n)
-            print(f"Wr before {i+1}-th update:", Wr, flush=True)
-            print(f"hatWr before {i+1}-th update:", hatWr, flush=True)
 
             hatWr, Qidxs = ldlq.LDLQ(V, zeroLRr, cb, args, for_kernel=has_kernel, scalar=scalar)
-            print(f"Wr after {i+1}-th update:", Wr, flush=True)
-            print(f"hatWr after {i+1}-th update:", hatWr, flush=True)
             Qidxs = Qidxs.cpu()
             packed = cb.pack_trellis(
                 Qidxs.reshape(m // args.td_x, args.td_x, n // args.td_y,
@@ -310,8 +323,12 @@ def quantize_finetune_decoder_layer(mixed_layer, quant_order, idx, cb, args,
             # hatWr = hatWr.flatten()[inverse_permutation].reshape(m, n)
             # scalar = scalar.flatten()[inverse_permutation].reshape(m, n)
 
-            print(f"Wr after {i+1}-th update and scaling:", Wr, flush=True)
-            print(f"hatWr after {i+1}-th update and scaling:", hatWr, flush=True)
+            print(f"********Updated W_{i+1} with LDLQ:*******", flush=True)
+            print(f"Wr: {Wr}", flush=True)
+            print(f"hatWr: {hatWr}", flush=True)
+            print(f"Squeezed D1 col: {squeezed_D1col}", flush=True)
+            print(f"Squeezed D2 row: {squeezed_D1row}", flush=True)
+            print(f"Hr: {HRr}", flush=True)
             err = torch.trace(
             (squeezed_D1col * (Wr - hatWr) * squeezed_D2row) @ HRr @ (squeezed_D2col * (Wr - hatWr).T * squeezed_D1row)) / torch.trace((squeezed_D1col * Wr * squeezed_D2row) @ HRr @ (squeezed_D2col * Wr.T * squeezed_D1row))
             print(
